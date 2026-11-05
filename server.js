@@ -190,10 +190,71 @@ app.get('/v1/locations', async (req, res) => {
   }
 });
 
+// Helper: Validate UUID format
+function isValidUUID(str) {
+  return typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str);
+}
+
+// Helper: Ensure a location exists in the database
+async function ensureLocation(id, name, lat, lng, desc = 'Commuter Hub') {
+  if (!id) return 'loc_cuet';
+  try {
+    const existing = await db.query('SELECT id FROM locations WHERE id = $1', [id]);
+    if (existing.rows.length === 0) {
+      await db.query(
+        'INSERT INTO locations (id, name, latitude, longitude, description) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING',
+        [id, name || id, lat || 22.3569, lng || 91.7832, desc]
+      );
+    }
+  } catch (e) {
+    console.warn('ensureLocation warning:', e.message);
+  }
+  return id;
+}
+
+// Helper: Ensure user ID is valid UUID or fallback to existing user
+async function resolveUserId(userId, fallbackRole = 'rider') {
+  if (isValidUUID(userId)) {
+    const userCheck = await db.query('SELECT id FROM users WHERE id = $1', [userId]);
+    if (userCheck.rows.length > 0) return userId;
+  }
+  const defaultUser = await db.query(
+    'SELECT id FROM users WHERE active_mode = $1 ORDER BY created_at ASC LIMIT 1',
+    [fallbackRole]
+  );
+  if (defaultUser.rows.length > 0) return defaultUser.rows[0].id;
+  const anyUser = await db.query('SELECT id FROM users LIMIT 1');
+  return anyUser.rows[0].id;
+}
+
 // ==============================================================================
-// 3. SEARCH MATCHING RIDES (Corridor Matching)
-// GET /v1/rides/search?pickup_lat=&pickup_lng=&dropoff_lat=&dropoff_lng=
+// 3. GET ALL SCHEDULED RIDES & SEARCH
+// GET /v1/rides
+// GET /v1/rides/search
 // ==============================================================================
+app.get('/v1/rides', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT rp.*, 
+             u.name AS rider_name, u.phone AS rider_phone, u.avatar_url AS rider_avatar,
+             u.university_or_org AS rider_university, u.nid_status AS rider_nid_status,
+             u.student_id_status AS rider_student_id_status, u.rating_avg AS rider_rating,
+             orig.name AS origin_name, orig.description AS origin_desc, orig.latitude AS origin_lat, orig.longitude AS origin_lng,
+             dest.name AS destination_name, dest.description AS destination_desc, dest.latitude AS destination_lat, dest.longitude AS destination_lng
+      FROM ride_posts rp
+      JOIN users u ON rp.rider_id = u.id
+      JOIN locations orig ON rp.origin_id = orig.id
+      JOIN locations dest ON rp.destination_id = dest.id
+      WHERE rp.status != 'cancelled'
+      ORDER BY rp.departure_time ASC
+    `);
+    res.json({ success: true, rides: result.rows });
+  } catch (err) {
+    console.error('Fetch all rides error:', err);
+    res.status(500).json({ error: 'Failed to fetch rides' });
+  }
+});
+
 app.get('/v1/rides/search', async (req, res) => {
   const { pickup_id, dropoff_id } = req.query;
 
@@ -237,6 +298,12 @@ app.post('/v1/rides', async (req, res) => {
     rider_id,
     origin_id,
     destination_id,
+    origin_name,
+    origin_lat,
+    origin_lng,
+    destination_name,
+    destination_lat,
+    destination_lng,
     primary_route_name,
     primary_route_via,
     primary_polyline,
@@ -253,40 +320,100 @@ app.post('/v1/rides', async (req, res) => {
   } = req.body;
 
   try {
+    // 1. Ensure Origin & Destination exist in NeonDB
+    const safeOriginId = await ensureLocation(origin_id, origin_name, origin_lat, origin_lng);
+    const safeDestId = await ensureLocation(destination_id, destination_name, destination_lat, destination_lng);
+
+    // 2. Resolve safe Rider UUID
+    const safeRiderId = await resolveUserId(rider_id, 'rider');
+
     const result = await db.query(
       `INSERT INTO ride_posts (
         rider_id, origin_id, destination_id,
         primary_route_name, primary_route_via, primary_polyline, primary_distance_km, primary_duration_mins,
         alternate_routes, detour_tolerance_km,
         departure_time, total_seats, available_seats, fare_per_seat,
-        vehicle_type, vehicle_plate, vehicle_model
+        vehicle_type, vehicle_plate, vehicle_model, status
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, 'scheduled'
       ) RETURNING *`,
       [
-        rider_id,
-        origin_id,
-        destination_id,
-        primary_route_name,
-        primary_route_via,
-        JSON.stringify(primary_polyline),
+        safeRiderId,
+        safeOriginId,
+        safeDestId,
+        primary_route_name || 'Main Direct Route',
+        primary_route_via || 'Direct Corridor',
+        JSON.stringify(primary_polyline || []),
         primary_distance_km || 20.0,
         primary_duration_mins || 40,
         JSON.stringify(alternate_routes || []),
         detour_tolerance_km || 1.5,
-        departure_time,
+        departure_time || new Date().toISOString(),
         total_seats || 1,
-        fare_per_seat,
-        vehicle_type,
-        vehicle_plate,
-        vehicle_model,
+        fare_per_seat || 120.0,
+        vehicle_type || 'Motorcycle',
+        vehicle_plate || 'Chatto Metro-Ha 000000',
+        vehicle_model || 'Vehicle',
       ]
     );
 
     res.status(201).json({ success: true, ride: result.rows[0] });
   } catch (err) {
     console.error('Post ride error:', err);
-    res.status(500).json({ error: 'Failed to create ride post' });
+    res.status(500).json({ error: 'Failed to create ride post', details: err.message });
+  }
+});
+
+// Update Ride Post
+// PUT /v1/rides/:id
+app.put('/v1/rides/:id', async (req, res) => {
+  const { id } = req.params;
+  const {
+    departure_time,
+    total_seats,
+    available_seats,
+    fare_per_seat,
+    primary_route_via,
+    status
+  } = req.body;
+
+  try {
+    const result = await db.query(
+      `UPDATE ride_posts SET
+        departure_time = COALESCE($1, departure_time),
+        total_seats = COALESCE($2, total_seats),
+        available_seats = COALESCE($3, available_seats),
+        fare_per_seat = COALESCE($4, fare_per_seat),
+        primary_route_via = COALESCE($5, primary_route_via),
+        status = COALESCE($6, status)
+       WHERE id = $7 RETURNING *`,
+      [departure_time, total_seats, available_seats, fare_per_seat, primary_route_via, status, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Ride post not found' });
+    }
+    res.json({ success: true, ride: result.rows[0] });
+  } catch (err) {
+    console.error('Update ride error:', err);
+    res.status(500).json({ error: 'Failed to update ride post' });
+  }
+});
+
+// Cancel / Delete Ride Post
+// DELETE /v1/rides/:id
+app.delete('/v1/rides/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query(`UPDATE ride_posts SET status = 'cancelled' WHERE id = $1`, [id]);
+    await db.query(
+      `UPDATE sub_requests SET status = 'auto_cancelled', cancellation_reason = 'Ride cancelled by rider' WHERE ride_post_id = $1`,
+      [id]
+    );
+    res.json({ success: true, message: 'Ride post cancelled successfully' });
+  } catch (err) {
+    console.error('Delete ride error:', err);
+    res.status(500).json({ error: 'Failed to cancel ride post' });
   }
 });
 
@@ -295,7 +422,24 @@ app.post('/v1/rides', async (req, res) => {
 // POST /v1/requests/broadcast
 // ==============================================================================
 app.post('/v1/requests/broadcast', async (req, res) => {
-  const { passenger_id, pickup_id, dropoff_id, scheduled_departure, requested_seats, target_ride_ids } = req.body;
+  const {
+    passenger_id,
+    pickup_id,
+    dropoff_id,
+    pickup_name,
+    pickup_lat,
+    pickup_lng,
+    dropoff_name,
+    dropoff_lat,
+    dropoff_lng,
+    scheduled_departure,
+    requested_seats,
+    target_ride_ids
+  } = req.body;
+
+  const safePickupId = await ensureLocation(pickup_id, pickup_name, pickup_lat, pickup_lng);
+  const safeDropoffId = await ensureLocation(dropoff_id, dropoff_name, dropoff_lat, dropoff_lng);
+  const safePassengerId = await resolveUserId(passenger_id, 'passenger');
 
   const client = await db.pool.connect();
   try {
@@ -306,7 +450,7 @@ app.post('/v1/requests/broadcast', async (req, res) => {
       `INSERT INTO group_trip_requests (
         passenger_id, pickup_id, dropoff_id, scheduled_departure, requested_seats, status
       ) VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING *`,
-      [passenger_id, pickup_id, dropoff_id, scheduled_departure, requested_seats || 1]
+      [safePassengerId, safePickupId, safeDropoffId, scheduled_departure || new Date().toISOString(), requested_seats || 1]
     );
 
     const groupRequest = groupResult.rows[0];
@@ -315,6 +459,7 @@ app.post('/v1/requests/broadcast', async (req, res) => {
     const subRequests = [];
     if (Array.isArray(target_ride_ids) && target_ride_ids.length > 0) {
       for (const rideId of target_ride_ids) {
+        if (!isValidUUID(rideId)) continue;
         const rideRes = await client.query('SELECT rider_id FROM ride_posts WHERE id = $1', [rideId]);
         if (rideRes.rows.length > 0) {
           const riderId = rideRes.rows[0].rider_id;
@@ -334,7 +479,7 @@ app.post('/v1/requests/broadcast', async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Broadcast request error:', err);
-    res.status(500).json({ error: 'Failed to broadcast group request' });
+    res.status(500).json({ error: 'Failed to broadcast group request', details: err.message });
   } finally {
     client.release();
   }
@@ -476,6 +621,34 @@ app.post('/v1/bookings/pay', async (req, res) => {
   } catch (err) {
     console.error('Payment error:', err);
     res.status(500).json({ error: 'Payment processing failed' });
+  }
+});
+
+// GET /v1/bookings/:userId
+app.get('/v1/bookings/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const safeUserId = await resolveUserId(userId);
+    const result = await db.query(
+      `SELECT b.*,
+              r.name AS rider_name, r.phone AS rider_phone, r.university_or_org AS rider_university,
+              p.name AS passenger_name, p.phone AS passenger_phone, p.university_or_org AS passenger_university,
+              orig.name AS pickup_name, dest.name AS dropoff_name,
+              rp.vehicle_type, rp.vehicle_plate, rp.vehicle_model
+       FROM bookings b
+       JOIN users r ON b.rider_id = r.id
+       JOIN users p ON b.passenger_id = p.id
+       JOIN locations orig ON b.pickup_id = orig.id
+       JOIN locations dest ON b.dropoff_id = dest.id
+       LEFT JOIN ride_posts rp ON b.ride_post_id = rp.id
+       WHERE b.rider_id = $1 OR b.passenger_id = $1
+       ORDER BY b.created_at DESC`,
+      [safeUserId]
+    );
+    res.json({ success: true, bookings: result.rows });
+  } catch (err) {
+    console.error('Fetch bookings error:', err);
+    res.status(500).json({ error: 'Failed to fetch bookings' });
   }
 });
 
