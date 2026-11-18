@@ -26,6 +26,7 @@ app.get('/', (req, res) => {
         rides: '/v1/rides',
         requests: '/v1/requests',
         bookings: '/v1/bookings/:userId',
+        fare_estimate: '/v1/fare/estimate',
         auth_login: '/v1/auth/login',
         auth_register: '/v1/auth/register',
         health: '/health',
@@ -837,6 +838,187 @@ app.get('/v1/bookings/:userId', async (req, res) => {
   } catch (err) {
     console.error('Fetch bookings error:', err);
     res.status(500).json({ error: 'Failed to fetch bookings' });
+  }
+});
+
+// AI-Powered Fare Estimation with Baseline Formula & Weather Surcharge
+// Formula: 50 BDT for 0-5 km, +10 BDT for each additional km.
+// Weather: if rain multiply by 1.25, else 1.0.
+// If AI API key is configured (Gemini, OpenAI, or Custom LLM), prompt AI to analyze & validate.
+app.post('/v1/fare/estimate', async (req, res) => {
+  try {
+    const {
+      distance_km,
+      origin,
+      destination,
+      weather,
+      departure_time,
+    } = req.body;
+
+    const dist = Math.max(0, parseFloat(distance_km) || 0);
+
+    // Baseline rule formula: 50tk for 0-5km and +10tk for each additional km
+    const baseFare = dist <= 5.0 ? 50.0 : 50.0 + (dist - 5.0) * 10.0;
+
+    // Weather condition multiplier: rain = 1.25, else = 1.0
+    const weatherStr = (weather || '').toString().toLowerCase();
+    const isRain = weatherStr.includes('rain');
+    const weatherMultiplier = isRain ? 1.25 : 1.0;
+    const ruleBasedFare = Math.round(baseFare * weatherMultiplier);
+
+    // Check for AI / LLM configuration in environment variables
+    const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    const openaiKey = process.env.OPENAI_API_KEY;
+    const customAiUrl = process.env.AI_API_URL;
+    const genericAiKey = process.env.AI_API_KEY || process.env.LLM_API_KEY;
+
+    let estimatedFare = ruleBasedFare;
+    let reasoning = `Base formula: 50 BDT (0-5 km) + 10 BDT/km for remaining ${(Math.max(0, dist - 5)).toFixed(1)} km${isRain ? ' × 1.25 rain surcharge' : ' × 1.0 standard weather'}.`;
+    let aiAdjusted = false;
+    let aiProvider = 'formula';
+
+    // 1. Google Gemini API (if GEMINI_API_KEY or AI_API_KEY is provided in .env)
+    if (geminiKey || (genericAiKey && (genericAiKey.startsWith('AIza') || !openaiKey))) {
+      const keyToUse = geminiKey || genericAiKey;
+      try {
+        const prompt = `You are an AI Fare Estimation Assistant for VROOM ride-sharing in Bangladesh.
+Route information:
+- Origin: ${origin || 'Pickup Location'}
+- Destination: ${destination || 'Dropoff Location'}
+- Distance: ${dist.toFixed(1)} km
+- Weather: ${isRain ? 'Rainy (Wet roads, slower traffic)' : 'Clear / Normal'}
+- Prescribed Baseline Formula:
+  * 0 to 5 km: 50 BDT
+  * Beyond 5 km: +10 BDT per additional km
+  * Weather multiplier: ${weatherMultiplier}x (${isRain ? 'Rain surcharge 25%' : 'Standard 1.0x'})
+  * Calculated Baseline Fare: ${ruleBasedFare} BDT
+
+Validate or calibrate this fare per seat in integer BDT, taking into account traffic, distance, and weather while keeping it reasonably aligned with ${ruleBasedFare} BDT.
+Provide a concise 1-sentence reasoning.
+Respond ONLY with a JSON object in this format:
+{"estimated_fare": ${ruleBasedFare}, "reasoning": "string"}`;
+
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${keyToUse}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: {
+                temperature: 0.2,
+                responseMimeType: 'application/json',
+              },
+            }),
+            signal: AbortSignal.timeout(6000),
+          }
+        );
+
+        if (geminiRes.ok) {
+          const geminiData = await geminiRes.json();
+          const candidateText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (candidateText) {
+            const parsed = JSON.parse(candidateText.replace(/```json|```/g, '').trim());
+            if (parsed && typeof parsed.estimated_fare === 'number') {
+              estimatedFare = Math.round(parsed.estimated_fare);
+              reasoning = parsed.reasoning || `AI validated fare for ${dist.toFixed(1)} km with ${isRain ? 'rain multiplier' : 'standard weather'}.`;
+              aiAdjusted = true;
+              aiProvider = 'gemini';
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Gemini API call failed, fell back to base formula:', err.message);
+      }
+    } else if (openaiKey || (genericAiKey && genericAiKey.startsWith('sk-'))) {
+      // 2. OpenAI API (if OPENAI_API_KEY provided in .env)
+      const keyToUse = openaiKey || genericAiKey;
+      try {
+        const openAiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${keyToUse}`,
+          },
+          body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+              {
+                role: 'system',
+                content: 'You are an AI Fare Estimation Assistant for VROOM ride-sharing. Return JSON only with estimated_fare (integer) and reasoning (string).',
+              },
+              {
+                role: 'user',
+                content: `Distance: ${dist.toFixed(1)} km, Origin: ${origin}, Destination: ${destination}, Weather: ${isRain ? 'Rain' : 'Clear'}. Prescribed baseline fare is ${ruleBasedFare} BDT (base: 50 BDT 0-5km, +10 BDT/km beyond 5km, weather multiplier: ${weatherMultiplier}). Provide estimated_fare (integer) and 1-sentence reasoning.`,
+              },
+            ],
+            response_format: { type: 'json_object' },
+          }),
+          signal: AbortSignal.timeout(6000),
+        });
+
+        if (openAiRes.ok) {
+          const openAiData = await openAiRes.json();
+          const content = openAiData?.choices?.[0]?.message?.content;
+          if (content) {
+            const parsed = JSON.parse(content);
+            if (parsed && typeof parsed.estimated_fare === 'number') {
+              estimatedFare = Math.round(parsed.estimated_fare);
+              reasoning = parsed.reasoning || `AI estimated fare based on route and weather.`;
+              aiAdjusted = true;
+              aiProvider = 'openai';
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('OpenAI API call failed, fell back to base formula:', err.message);
+      }
+    } else if (customAiUrl) {
+      // 3. Custom AI endpoint
+      try {
+        const customRes = await fetch(customAiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            distance_km: dist,
+            origin,
+            destination,
+            weather: isRain ? 'rain' : 'clear',
+            weather_multiplier: weatherMultiplier,
+            rule_based_fare: ruleBasedFare,
+          }),
+          signal: AbortSignal.timeout(6000),
+        });
+
+        if (customRes.ok) {
+          const customData = await customRes.json();
+          if (customData && typeof customData.estimated_fare === 'number') {
+            estimatedFare = Math.round(customData.estimated_fare);
+            reasoning = customData.reasoning || 'Custom AI estimated fare.';
+            aiAdjusted = true;
+            aiProvider = 'custom';
+          }
+        }
+      } catch (err) {
+        console.warn('Custom AI API call failed, fell back to base formula:', err.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      estimated_fare: estimatedFare,
+      base_fare: baseFare,
+      distance_km: dist,
+      weather: isRain ? 'rain' : 'clear',
+      weather_multiplier: weatherMultiplier,
+      rule_based_fare: ruleBasedFare,
+      ai_adjusted: aiAdjusted,
+      provider: aiProvider,
+      reasoning: reasoning,
+    });
+  } catch (err) {
+    console.error('Fare estimation error:', err);
+    res.status(500).json({ error: 'Failed to estimate fare' });
   }
 });
 
