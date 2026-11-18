@@ -434,9 +434,9 @@ app.get('/v1/rides/search', async (req, res) => {
              orig.name AS origin_name, orig.latitude AS origin_lat, orig.longitude AS origin_lng,
              dest.name AS destination_name, dest.latitude AS destination_lat, dest.longitude AS destination_lng
       FROM ride_posts rp
-      JOIN users u ON rp.rider_id = u.id
-      JOIN locations orig ON rp.origin_id = orig.id
-      JOIN locations dest ON rp.destination_id = dest.id
+      LEFT JOIN users u ON rp.rider_id = u.id
+      LEFT JOIN locations orig ON rp.origin_id = orig.id
+      LEFT JOIN locations dest ON rp.destination_id = dest.id
       WHERE rp.status = 'scheduled' AND rp.available_seats > 0
     `;
 
