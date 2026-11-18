@@ -819,19 +819,19 @@ app.get('/v1/bookings/:userId', async (req, res) => {
     const safeUserId = await resolveUserId(userId);
     const result = await db.query(
       `SELECT b.*,
-              r.name AS rider_name, r.phone AS rider_phone, r.university_or_org AS rider_university,
-              p.name AS passenger_name, p.phone AS passenger_phone, p.university_or_org AS passenger_university,
+              r.name AS rider_name, r.email AS rider_email, r.phone AS rider_phone, r.university_or_org AS rider_university,
+              p.name AS passenger_name, p.email AS passenger_email, p.phone AS passenger_phone, p.university_or_org AS passenger_university,
               orig.name AS pickup_name, dest.name AS dropoff_name,
               rp.vehicle_type, rp.vehicle_plate, rp.vehicle_model
        FROM bookings b
-       JOIN users r ON b.rider_id = r.id
-       JOIN users p ON b.passenger_id = p.id
-       JOIN locations orig ON b.pickup_id = orig.id
-       JOIN locations dest ON b.dropoff_id = dest.id
+       LEFT JOIN users r ON b.rider_id = r.id
+       LEFT JOIN users p ON b.passenger_id = p.id
+       LEFT JOIN locations orig ON b.pickup_id = orig.id
+       LEFT JOIN locations dest ON b.dropoff_id = dest.id
        LEFT JOIN ride_posts rp ON b.ride_post_id = rp.id
-       WHERE b.rider_id = $1 OR b.passenger_id = $1
+       WHERE b.rider_id = $1 OR b.passenger_id = $1 OR b.rider_id = $2 OR b.passenger_id = $2
        ORDER BY b.created_at DESC`,
-      [safeUserId]
+      [safeUserId, userId]
     );
     res.json({ success: true, bookings: result.rows });
   } catch (err) {
