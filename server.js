@@ -212,11 +212,28 @@ async function ensureLocation(id, name, lat, lng, desc = 'Commuter Hub') {
   return id;
 }
 
-// Helper: Ensure user ID is valid UUID or fallback to existing user
-async function resolveUserId(userId, fallbackRole = 'rider') {
+// Helper: Ensure user ID is valid UUID or match by email or fallback to existing user
+async function resolveUserId(userId, email, name, phone, fallbackRole = 'rider') {
   if (isValidUUID(userId)) {
     const userCheck = await db.query('SELECT id FROM users WHERE id = $1', [userId]);
     if (userCheck.rows.length > 0) return userId;
+  }
+  if (email && email.trim()) {
+    const emailCheck = await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email.trim()]);
+    if (emailCheck.rows.length > 0) return emailCheck.rows[0].id;
+
+    // Create user record for this commuter so they have a persistent UUID in NeonDB
+    try {
+      const newUser = await db.query(
+        `INSERT INTO users (
+          name, email, password_hash, phone, university_or_org,
+          nid_status, student_id_status, active_mode, rating_avg, total_trips
+        ) VALUES ($1, $2, 'persisted_user', $3, 'Verified Commuter', 'verified', 'verified', $4, 5.0, 1)
+        RETURNING id`,
+        [name || 'Verified Commuter', email.trim().toLowerCase(), phone || '+880 1700-000000', fallbackRole]
+      );
+      if (newUser.rows.length > 0) return newUser.rows[0].id;
+    } catch (_) {}
   }
   const defaultUser = await db.query(
     'SELECT id FROM users WHERE active_mode = $1 ORDER BY created_at ASC LIMIT 1',
@@ -236,7 +253,7 @@ app.get('/v1/rides', async (req, res) => {
   try {
     const result = await db.query(`
       SELECT rp.*, 
-             u.name AS rider_name, u.phone AS rider_phone, u.avatar_url AS rider_avatar,
+             u.name AS rider_name, u.email AS rider_email, u.phone AS rider_phone, u.avatar_url AS rider_avatar,
              u.university_or_org AS rider_university, u.nid_status AS rider_nid_status,
              u.student_id_status AS rider_student_id_status, u.rating_avg AS rider_rating,
              orig.name AS origin_name, orig.description AS origin_desc, orig.latitude AS origin_lat, orig.longitude AS origin_lng,
@@ -246,7 +263,7 @@ app.get('/v1/rides', async (req, res) => {
       JOIN locations orig ON rp.origin_id = orig.id
       JOIN locations dest ON rp.destination_id = dest.id
       WHERE rp.status != 'cancelled'
-      ORDER BY rp.departure_time ASC
+      ORDER BY rp.created_at DESC
     `);
     res.json({ success: true, rides: result.rows });
   } catch (err) {
@@ -296,6 +313,9 @@ app.get('/v1/rides/search', async (req, res) => {
 app.post('/v1/rides', async (req, res) => {
   const {
     rider_id,
+    rider_email,
+    rider_name,
+    rider_phone,
     origin_id,
     destination_id,
     origin_name,
@@ -324,8 +344,8 @@ app.post('/v1/rides', async (req, res) => {
     const safeOriginId = await ensureLocation(origin_id, origin_name, origin_lat, origin_lng);
     const safeDestId = await ensureLocation(destination_id, destination_name, destination_lat, destination_lng);
 
-    // 2. Resolve safe Rider UUID
-    const safeRiderId = await resolveUserId(rider_id, 'rider');
+    // 2. Resolve safe Rider UUID (matches by UUID or email or creates user)
+    const safeRiderId = await resolveUserId(rider_id, rider_email, rider_name, rider_phone, 'rider');
 
     const result = await db.query(
       `INSERT INTO ride_posts (
@@ -424,6 +444,9 @@ app.delete('/v1/rides/:id', async (req, res) => {
 app.post('/v1/requests/broadcast', async (req, res) => {
   const {
     passenger_id,
+    passenger_email,
+    passenger_name,
+    passenger_phone,
     pickup_id,
     dropoff_id,
     pickup_name,
@@ -439,7 +462,7 @@ app.post('/v1/requests/broadcast', async (req, res) => {
 
   const safePickupId = await ensureLocation(pickup_id, pickup_name, pickup_lat, pickup_lng);
   const safeDropoffId = await ensureLocation(dropoff_id, dropoff_name, dropoff_lat, dropoff_lng);
-  const safePassengerId = await resolveUserId(passenger_id, 'passenger');
+  const safePassengerId = await resolveUserId(passenger_id, passenger_email, passenger_name, passenger_phone, 'passenger');
 
   const client = await db.pool.connect();
   try {
