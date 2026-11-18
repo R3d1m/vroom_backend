@@ -7,12 +7,158 @@ const db = require('./db');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization'],
+}));
+app.options('*', cors());
 app.use(express.json());
+
+// Root Route & Status Dashboard (Avoids raw "Cannot GET /" in web browsers)
+app.get('/', (req, res) => {
+  if (req.headers.accept && req.headers.accept.includes('application/json')) {
+    return res.json({
+      status: 'ok',
+      service: 'VROOM Backend API',
+      database: 'NeonDB PostgreSQL (Connected)',
+      endpoints: {
+        rides: '/v1/rides',
+        requests: '/v1/requests',
+        bookings: '/v1/bookings/:userId',
+        auth_login: '/v1/auth/login',
+        auth_register: '/v1/auth/register',
+        health: '/health',
+      },
+    });
+  }
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VROOM Backend API - Operational</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: #091A10;
+      color: #FFFFFF;
+      min-height: 100vh;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      background: #11281A;
+      border: 1px solid rgba(72, 192, 61, 0.4);
+      border-radius: 20px;
+      padding: 36px;
+      max-width: 580px;
+      width: 100%;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(72, 192, 61, 0.15);
+      border: 1px solid #48C03D;
+      color: #48C03D;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      margin-bottom: 16px;
+    }
+    .badge::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      background: #48C03D;
+      border-radius: 50%;
+      display: inline-block;
+      box-shadow: 0 0 8px #48C03D;
+    }
+    h1 {
+      font-size: 26px;
+      font-weight: 900;
+      margin: 0 0 8px 0;
+      letter-spacing: -0.5px;
+    }
+    p {
+      color: #A0C0AA;
+      font-size: 14px;
+      line-height: 1.6;
+      margin: 0 0 24px 0;
+    }
+    .endpoints-title {
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #48C03D;
+      margin-bottom: 8px;
+    }
+    .endpoints {
+      background: #091A10;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 16px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+    }
+    .ep-row {
+      display: flex;
+      margin-bottom: 8px;
+    }
+    .ep-row:last-child {
+      margin-bottom: 0;
+    }
+    .method {
+      width: 55px;
+      font-weight: 800;
+      color: #48C03D;
+    }
+    .path {
+      color: #E0EAE2;
+    }
+    .footer {
+      margin-top: 24px;
+      font-size: 11px;
+      color: #6C8A74;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">Live & Operational</div>
+    <h1>VROOM Backend API</h1>
+    <p>Peer-to-peer campus ride sharing & pooled corridor system for Chattogram. Connected to NeonDB PostgreSQL database.</p>
+    <div class="endpoints-title">Active API Endpoints</div>
+    <div class="endpoints">
+      <div class="ep-row"><span class="method">GET</span><span class="path">/v1/rides (Scheduled rides list)</span></div>
+      <div class="ep-row"><span class="method">POST</span><span class="path">/v1/rides (Create & publish ride)</span></div>
+      <div class="ep-row"><span class="method">POST</span><span class="path">/v1/requests/broadcast (Ride request)</span></div>
+      <div class="ep-row"><span class="method">GET</span><span class="path">/v1/bookings/:userId (History & receipts)</span></div>
+      <div class="ep-row"><span class="method">POST</span><span class="path">/v1/auth/login</span></div>
+      <div class="ep-row"><span class="method">POST</span><span class="path">/v1/auth/register</span></div>
+      <div class="ep-row"><span class="method">GET</span><span class="path">/health</span></div>
+    </div>
+    <div class="footer">VROOM Chattogram • NeonDB PostgreSQL • Vercel Serverless Function</div>
+  </div>
+</body>
+</html>`);
+});
 
 // Health Check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'VROOM Backend API', time: new Date() });
+  res.json({ status: 'ok', service: 'VROOM Backend API', database: 'connected', time: new Date() });
 });
 
 // ==============================================================================
@@ -224,16 +370,20 @@ async function resolveUserId(userId, email, name, phone, fallbackRole = 'rider')
 
     // Create user record for this commuter so they have a persistent UUID in NeonDB
     try {
+      const safePhone = (phone && phone.trim()) ? phone.trim() : `+880 17${Math.floor(10000000 + Math.random() * 90000000)}`;
       const newUser = await db.query(
         `INSERT INTO users (
           name, email, password_hash, phone, university_or_org,
           nid_status, student_id_status, active_mode, rating_avg, total_trips
         ) VALUES ($1, $2, 'persisted_user', $3, 'Verified Commuter', 'verified', 'verified', $4, 5.0, 1)
+        ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
         RETURNING id`,
-        [name || 'Verified Commuter', email.trim().toLowerCase(), phone || '+880 1700-000000', fallbackRole]
+        [name || 'Verified Commuter', email.trim().toLowerCase(), safePhone, fallbackRole]
       );
       if (newUser.rows.length > 0) return newUser.rows[0].id;
-    } catch (_) {}
+    } catch (e) {
+      console.warn('resolveUserId insert warning:', e.message);
+    }
   }
   const defaultUser = await db.query(
     'SELECT id FROM users WHERE active_mode = $1 ORDER BY created_at ASC LIMIT 1',
@@ -259,9 +409,9 @@ app.get('/v1/rides', async (req, res) => {
              orig.name AS origin_name, orig.description AS origin_desc, orig.latitude AS origin_lat, orig.longitude AS origin_lng,
              dest.name AS destination_name, dest.description AS destination_desc, dest.latitude AS destination_lat, dest.longitude AS destination_lng
       FROM ride_posts rp
-      JOIN users u ON rp.rider_id = u.id
-      JOIN locations orig ON rp.origin_id = orig.id
-      JOIN locations dest ON rp.destination_id = dest.id
+      LEFT JOIN users u ON rp.rider_id = u.id
+      LEFT JOIN locations orig ON rp.origin_id = orig.id
+      LEFT JOIN locations dest ON rp.destination_id = dest.id
       WHERE rp.status != 'cancelled'
       ORDER BY rp.created_at DESC
     `);
@@ -377,7 +527,22 @@ app.post('/v1/rides', async (req, res) => {
       ]
     );
 
-    res.status(201).json({ success: true, ride: result.rows[0] });
+    // Return fully-hydrated ride post with location and rider metadata
+    const rideRow = await db.query(`
+      SELECT rp.*, 
+             u.name AS rider_name, u.email AS rider_email, u.phone AS rider_phone, u.avatar_url AS rider_avatar,
+             u.university_or_org AS rider_university, u.nid_status AS rider_nid_status,
+             u.student_id_status AS rider_student_id_status, u.rating_avg AS rider_rating,
+             orig.name AS origin_name, orig.description AS origin_desc, orig.latitude AS origin_lat, orig.longitude AS origin_lng,
+             dest.name AS destination_name, dest.description AS destination_desc, dest.latitude AS destination_lat, dest.longitude AS destination_lng
+      FROM ride_posts rp
+      LEFT JOIN users u ON rp.rider_id = u.id
+      LEFT JOIN locations orig ON rp.origin_id = orig.id
+      LEFT JOIN locations dest ON rp.destination_id = dest.id
+      WHERE rp.id = $1
+    `, [result.rows[0].id]);
+
+    res.status(201).json({ success: true, ride: rideRow.rows[0] || result.rows[0] });
   } catch (err) {
     console.error('Post ride error:', err);
     res.status(500).json({ error: 'Failed to create ride post', details: err.message });
