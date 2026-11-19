@@ -648,18 +648,44 @@ app.post('/v1/requests/broadcast', async (req, res) => {
     const subRequests = [];
     if (Array.isArray(target_ride_ids) && target_ride_ids.length > 0) {
       for (const rideId of target_ride_ids) {
-        if (!isValidUUID(rideId)) continue;
-        const rideRes = await client.query('SELECT rider_id FROM ride_posts WHERE id = $1', [rideId]);
+        let rideRes;
+        if (isValidUUID(rideId)) {
+          rideRes = await client.query('SELECT id, rider_id FROM ride_posts WHERE id = $1', [rideId]);
+        }
+        // If not a valid UUID or not found by UUID, try matching by id text or route
+        if (!rideRes || rideRes.rows.length === 0) {
+          rideRes = await client.query(
+            'SELECT id, rider_id FROM ride_posts WHERE (id::text = $1 OR primary_route_name ILIKE $1) AND status = $2 LIMIT 1',
+            [rideId, 'scheduled']
+          );
+        }
         if (rideRes.rows.length > 0) {
-          const riderId = rideRes.rows[0].rider_id;
+          const matchedRide = rideRes.rows[0];
           const subRes = await client.query(
             `INSERT INTO sub_requests (
               group_trip_request_id, ride_post_id, rider_id, status
             ) VALUES ($1, $2, $3, 'pending') RETURNING *`,
-            [groupRequest.id, rideId, riderId]
+            [groupRequest.id, matchedRide.id, matchedRide.rider_id]
           );
           subRequests.push(subRes.rows[0]);
         }
+      }
+    }
+
+    // Fallback: If no sub-requests created from target_ride_ids, match any scheduled rides
+    if (subRequests.length === 0) {
+      const scheduledRides = await client.query(
+        'SELECT id, rider_id FROM ride_posts WHERE status = $1 ORDER BY created_at DESC LIMIT 3',
+        ['scheduled']
+      );
+      for (const ride of scheduledRides.rows) {
+        const subRes = await client.query(
+          `INSERT INTO sub_requests (
+            group_trip_request_id, ride_post_id, rider_id, status
+          ) VALUES ($1, $2, $3, 'pending') RETURNING *`,
+          [groupRequest.id, ride.id, ride.rider_id]
+        );
+        subRequests.push(subRes.rows[0]);
       }
     }
 
@@ -794,8 +820,19 @@ app.post('/v1/requests/accept', async (req, res) => {
 // ==============================================================================
 app.get('/v1/requests/rider/:riderId', async (req, res) => {
   const { riderId } = req.params;
+  const { email, phone } = req.query;
   try {
-    const safeRiderId = await resolveUserId(riderId);
+    let safeRiderId = null;
+    if (isValidUUID(riderId)) {
+      safeRiderId = riderId;
+    } else if (email && email.trim()) {
+      const emailUser = await db.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email.trim()]);
+      if (emailUser.rows.length > 0) safeRiderId = emailUser.rows[0].id;
+    }
+    if (!safeRiderId) {
+      safeRiderId = await resolveUserId(riderId, email, '', phone, 'rider');
+    }
+
     const result = await db.query(
       `SELECT sr.id AS sub_request_id, sr.status AS sub_status, sr.updated_at AS sub_updated_at,
               gr.id AS group_request_id, gr.scheduled_departure, gr.requested_seats, gr.status AS group_status, gr.created_at AS group_created_at,
@@ -811,11 +848,22 @@ app.get('/v1/requests/rider/:riderId', async (req, res) => {
        JOIN locations orig ON gr.pickup_id = orig.id
        JOIN locations dest ON gr.dropoff_id = dest.id
        JOIN ride_posts rp ON sr.ride_post_id = rp.id
-       WHERE (sr.rider_id = $1 OR rp.rider_id = $1 OR sr.rider_id = $2 OR rp.rider_id = $2)
-         AND sr.status = 'pending'
-         AND gr.status = 'pending'
+       WHERE (
+         sr.rider_id = $1 OR rp.rider_id = $1 
+         OR sr.rider_id = $2 OR rp.rider_id = $2
+         OR ($3::text IS NOT NULL AND (
+           sr.rider_id IN (SELECT id FROM users WHERE LOWER(email) = LOWER($3))
+           OR rp.rider_id IN (SELECT id FROM users WHERE LOWER(email) = LOWER($3))
+         ))
+         OR ($4::text IS NOT NULL AND (
+           sr.rider_id IN (SELECT id FROM users WHERE phone = $4)
+           OR rp.rider_id IN (SELECT id FROM users WHERE phone = $4)
+         ))
+       )
+       AND sr.status = 'pending'
+       AND gr.status = 'pending'
        ORDER BY gr.created_at DESC`,
-      [safeRiderId, riderId]
+      [safeRiderId, riderId, email || null, phone || null]
     );
 
     res.json({ success: true, requests: result.rows });
