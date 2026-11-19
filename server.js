@@ -850,7 +850,7 @@ app.get('/v1/requests/rider/:riderId', async (req, res) => {
        JOIN ride_posts rp ON sr.ride_post_id = rp.id
        WHERE (
          sr.rider_id = $1 OR rp.rider_id = $1 
-         OR sr.rider_id = $2 OR rp.rider_id = $2
+         OR sr.rider_id::text = $2 OR rp.rider_id::text = $2
          OR ($3::text IS NOT NULL AND (
            sr.rider_id IN (SELECT id FROM users WHERE LOWER(email) = LOWER($3))
            OR rp.rider_id IN (SELECT id FROM users WHERE LOWER(email) = LOWER($3))
