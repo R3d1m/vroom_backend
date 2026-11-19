@@ -711,44 +711,76 @@ app.post('/v1/requests/accept', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Lock and verify group request is still pending (Prevents race condition!)
-    const groupCheck = await client.query(
-      'SELECT * FROM group_trip_requests WHERE id = $1 FOR UPDATE',
-      [group_request_id]
-    );
+    // 1. Lock and verify group request is still pending
+    let groupReq;
+    if (isValidUUID(group_request_id)) {
+      const groupCheck = await client.query(
+        'SELECT * FROM group_trip_requests WHERE id = $1 FOR UPDATE',
+        [group_request_id]
+      );
+      if (groupCheck.rows.length > 0) groupReq = groupCheck.rows[0];
+    }
+    if (!groupReq) {
+      const fallbackCheck = await client.query(
+        `SELECT gr.* FROM group_trip_requests gr 
+         JOIN sub_requests sr ON sr.group_trip_request_id = gr.id 
+         WHERE (sr.ride_post_id::text = $1 OR gr.id::text = $2) AND gr.status = 'pending' 
+         ORDER BY gr.created_at DESC LIMIT 1 FOR UPDATE`,
+        [ride_post_id, group_request_id]
+      );
+      if (fallbackCheck.rows.length > 0) groupReq = fallbackCheck.rows[0];
+    }
 
-    if (groupCheck.rows.length === 0) {
+    if (!groupReq) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Group request not found' });
     }
 
-    const groupReq = groupCheck.rows[0];
     if (groupReq.status !== 'pending') {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Request is no longer pending (already accepted or cancelled)' });
     }
 
     // 2. Lock and verify ride post has enough seats
-    const rideCheck = await client.query(
-      'SELECT * FROM ride_posts WHERE id = $1 FOR UPDATE',
-      [ride_post_id]
-    );
+    let safeRidePostId = ride_post_id;
+    let ridePost;
+    if (isValidUUID(ride_post_id)) {
+      const rideCheck = await client.query(
+        'SELECT * FROM ride_posts WHERE id = $1 FOR UPDATE',
+        [ride_post_id]
+      );
+      if (rideCheck.rows.length > 0) {
+        ridePost = rideCheck.rows[0];
+        safeRidePostId = ridePost.id;
+      }
+    }
+    if (!ridePost) {
+      const fallbackRide = await client.query(
+        'SELECT * FROM ride_posts WHERE status = $1 ORDER BY created_at DESC LIMIT 1 FOR UPDATE',
+        ['scheduled']
+      );
+      if (fallbackRide.rows.length > 0) {
+        ridePost = fallbackRide.rows[0];
+        safeRidePostId = ridePost.id;
+      }
+    }
 
-    if (rideCheck.rows.length === 0) {
+    if (!ridePost) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Ride post not found' });
     }
 
-    const ridePost = rideCheck.rows[0];
     if (ridePost.available_seats < groupReq.requested_seats) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Not enough seats available on this ride' });
     }
 
+    const safeRiderId = await resolveUserId(rider_id, '', '', '', 'rider');
+
     // 3. Decrement available seats
     await client.query(
-      'UPDATE ride_posts SET available_seats = available_seats - $1 WHERE id = $2',
-      [groupReq.requested_seats, ride_post_id]
+      'UPDATE ride_posts SET available_seats = GREATEST(available_seats - $1, 0) WHERE id = $2',
+      [groupReq.requested_seats, safeRidePostId]
     );
 
     // 4. Mark Group Request as ACCEPTED
@@ -756,15 +788,15 @@ app.post('/v1/requests/accept', async (req, res) => {
       `UPDATE group_trip_requests 
        SET status = 'accepted', accepted_ride_post_id = $1, accepted_rider_id = $2, updated_at = NOW()
        WHERE id = $3`,
-      [ride_post_id, rider_id, group_request_id]
+      [safeRidePostId, safeRiderId, groupReq.id]
     );
 
     // 5. ATOMIC AUTO-CANCELLATION: Accept this rider's sub-request, AUTO-CANCEL ALL SIBLINGS!
     await client.query(
       `UPDATE sub_requests 
        SET status = 'accepted', updated_at = NOW() 
-       WHERE group_trip_request_id = $1 AND ride_post_id = $2`,
-      [group_request_id, ride_post_id]
+       WHERE group_trip_request_id = $1 AND (ride_post_id = $2 OR rider_id = $3)`,
+      [groupReq.id, safeRidePostId, safeRiderId]
     );
 
     await client.query(
@@ -773,41 +805,52 @@ app.post('/v1/requests/accept', async (req, res) => {
            cancellation_reason = 'Passenger ride matched with another rider',
            updated_at = NOW() 
        WHERE group_trip_request_id = $1 AND ride_post_id != $2`,
-      [group_request_id, ride_post_id]
+      [groupReq.id, safeRidePostId]
     );
 
-    // 6. Generate Confirmed Booking with 4-Digit Security PIN
-    const pinCode = Math.floor(1000 + Math.random() * 9000).toString();
-    const totalFare = parseFloat(ridePost.fare_per_seat) * groupReq.requested_seats;
-
-    const bookingRes = await client.query(
-      `INSERT INTO bookings (
-        ride_post_id, rider_id, passenger_id, pickup_id, dropoff_id,
-        scheduled_time, fare, pin_code, trip_status
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed') RETURNING *`,
-      [
-        ride_post_id,
-        rider_id,
-        groupReq.passenger_id,
-        groupReq.pickup_id,
-        groupReq.dropoff_id,
-        groupReq.scheduled_departure,
-        totalFare,
-        pinCode,
-      ]
+    // 6. Generate Confirmed Booking with 4-Digit Security PIN (Check deduplication)
+    const existingBooking = await client.query(
+      `SELECT * FROM bookings WHERE ride_post_id = $1 AND passenger_id = $2 AND trip_status != 'cancelled' LIMIT 1`,
+      [safeRidePostId, groupReq.passenger_id]
     );
+
+    let finalBooking;
+    if (existingBooking.rows.length > 0) {
+      finalBooking = existingBooking.rows[0];
+    } else {
+      const pinCode = Math.floor(1000 + Math.random() * 9000).toString();
+      const totalFare = parseFloat(ridePost.fare_per_seat || '120.0') * groupReq.requested_seats;
+
+      const bookingRes = await client.query(
+        `INSERT INTO bookings (
+          ride_post_id, rider_id, passenger_id, pickup_id, dropoff_id,
+          scheduled_time, fare, pin_code, trip_status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed') RETURNING *`,
+        [
+          safeRidePostId,
+          safeRiderId,
+          groupReq.passenger_id,
+          groupReq.pickup_id,
+          groupReq.dropoff_id,
+          groupReq.scheduled_departure,
+          totalFare,
+          pinCode,
+        ]
+      );
+      finalBooking = bookingRes.rows[0];
+    }
 
     await client.query('COMMIT');
 
     return res.json({
       success: true,
       message: 'Ride confirmed. Sibling requests automatically cancelled.',
-      booking: bookingRes.rows[0],
+      booking: finalBooking,
     });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Accept request error:', err);
-    return res.status(500).json({ error: 'Failed to accept ride request' });
+    return res.status(500).json({ error: 'Failed to accept ride request', details: err.message });
   } finally {
     client.release();
   }
@@ -900,26 +943,114 @@ app.get('/v1/requests/passenger/:passengerId', async (req, res) => {
 // ==============================================================================
 // 7. DIGITAL PAYMENTS & SETTLEMENT (bKash / Nagad / Cash)
 // POST /v1/bookings/pay
+// POST /v1/bookings/status
 // ==============================================================================
-app.post('/v1/bookings/pay', async (req, res) => {
-  const { booking_id, payment_method } = req.body;
+app.post('/v1/bookings/status', async (req, res) => {
+  const { booking_id, trip_status } = req.body;
+  if (!booking_id || !trip_status) {
+    return res.status(400).json({ error: 'Missing booking_id or trip_status' });
+  }
 
   try {
-    const result = await db.query(
-      `UPDATE bookings 
-       SET payment_status = 'paid', payment_method = $1, trip_status = 'completed'
-       WHERE id = $2 RETURNING *`,
-      [payment_method || 'bKash', booking_id]
-    );
+    let result;
+    if (isValidUUID(booking_id)) {
+      result = await db.query(
+        `UPDATE bookings 
+         SET trip_status = $1
+         WHERE id = $2 RETURNING *`,
+        [trip_status, booking_id]
+      );
+    } else {
+      result = await db.query(
+        `UPDATE bookings 
+         SET trip_status = $1
+         WHERE id::text = $2 RETURNING *`,
+        [trip_status, booking_id]
+      );
+    }
+
+    if (result.rows.length === 0) {
+      result = await db.query(
+        `UPDATE bookings 
+         SET trip_status = $1
+         WHERE pin_code = $2 RETURNING *`,
+        [trip_status, booking_id]
+      );
+    }
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Booking not found' });
     }
 
-    res.json({ success: true, booking: result.rows[0] });
+    const updatedBooking = result.rows[0];
+
+    // Synchronize ride_posts status if applicable
+    if (updatedBooking.ride_post_id) {
+      try {
+        if (trip_status === 'completed') {
+          await db.query(`UPDATE ride_posts SET status = 'completed' WHERE id = $1`, [updatedBooking.ride_post_id]);
+        } else if (trip_status === 'inProgress') {
+          await db.query(`UPDATE ride_posts SET status = 'ongoing' WHERE id = $1`, [updatedBooking.ride_post_id]);
+        }
+      } catch (e) {
+        console.warn('Could not update ride_post status:', e.message);
+      }
+    }
+
+    res.json({ success: true, booking: updatedBooking });
+  } catch (err) {
+    console.error('Update booking status error:', err);
+    res.status(500).json({ error: 'Failed to update booking status', details: err.message });
+  }
+});
+
+app.post('/v1/bookings/pay', async (req, res) => {
+  const { booking_id, payment_method } = req.body;
+
+  try {
+    let result;
+    if (isValidUUID(booking_id)) {
+      result = await db.query(
+        `UPDATE bookings 
+         SET payment_status = 'paid', payment_method = $1, trip_status = 'completed'
+         WHERE id = $2 RETURNING *`,
+        [payment_method || 'bKash', booking_id]
+      );
+    } else {
+      result = await db.query(
+        `UPDATE bookings 
+         SET payment_status = 'paid', payment_method = $1, trip_status = 'completed'
+         WHERE id::text = $2 RETURNING *`,
+        [payment_method || 'bKash', booking_id]
+      );
+    }
+
+    if (result.rows.length === 0) {
+      result = await db.query(
+        `UPDATE bookings 
+         SET payment_status = 'paid', payment_method = $1, trip_status = 'completed'
+         WHERE pin_code = $2 RETURNING *`,
+        [payment_method || 'bKash', booking_id]
+      );
+    }
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    const updatedBooking = result.rows[0];
+    if (updatedBooking.ride_post_id) {
+      try {
+        await db.query(`UPDATE ride_posts SET status = 'completed' WHERE id = $1`, [updatedBooking.ride_post_id]);
+      } catch (e) {
+        console.warn('Could not update ride_post status to completed:', e.message);
+      }
+    }
+
+    res.json({ success: true, booking: updatedBooking });
   } catch (err) {
     console.error('Payment error:', err);
-    res.status(500).json({ error: 'Payment processing failed' });
+    res.status(500).json({ error: 'Payment processing failed', details: err.message });
   }
 });
 
