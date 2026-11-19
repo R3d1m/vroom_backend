@@ -788,6 +788,68 @@ app.post('/v1/requests/accept', async (req, res) => {
 });
 
 // ==============================================================================
+// 6.5. FETCH PENDING RIDE REQUESTS (For Rider & Passenger)
+// GET /v1/requests/rider/:riderId
+// GET /v1/requests/passenger/:passengerId
+// ==============================================================================
+app.get('/v1/requests/rider/:riderId', async (req, res) => {
+  const { riderId } = req.params;
+  try {
+    const safeRiderId = await resolveUserId(riderId);
+    const result = await db.query(
+      `SELECT sr.id AS sub_request_id, sr.status AS sub_status, sr.updated_at AS sub_updated_at,
+              gr.id AS group_request_id, gr.scheduled_departure, gr.requested_seats, gr.status AS group_status, gr.created_at AS group_created_at,
+              p.id AS passenger_id, p.name AS passenger_name, p.phone AS passenger_phone, p.avatar_url AS passenger_avatar,
+              p.university_or_org AS passenger_university, p.rating_avg AS passenger_rating,
+              orig.id AS pickup_id, orig.name AS pickup_name, orig.latitude AS pickup_lat, orig.longitude AS pickup_lng,
+              dest.id AS dropoff_id, dest.name AS dropoff_name, dest.latitude AS dropoff_lat, dest.longitude AS dropoff_lng,
+              rp.id AS ride_post_id, rp.primary_route_name, rp.primary_route_via, rp.fare_per_seat,
+              rp.vehicle_type, rp.vehicle_model, rp.vehicle_plate
+       FROM sub_requests sr
+       JOIN group_trip_requests gr ON sr.group_trip_request_id = gr.id
+       JOIN users p ON gr.passenger_id = p.id
+       JOIN locations orig ON gr.pickup_id = orig.id
+       JOIN locations dest ON gr.dropoff_id = dest.id
+       JOIN ride_posts rp ON sr.ride_post_id = rp.id
+       WHERE (sr.rider_id = $1 OR rp.rider_id = $1 OR sr.rider_id = $2 OR rp.rider_id = $2)
+         AND sr.status = 'pending'
+         AND gr.status = 'pending'
+       ORDER BY gr.created_at DESC`,
+      [safeRiderId, riderId]
+    );
+
+    res.json({ success: true, requests: result.rows });
+  } catch (err) {
+    console.error('Fetch rider requests error:', err);
+    res.status(500).json({ error: 'Failed to fetch rider requests' });
+  }
+});
+
+app.get('/v1/requests/passenger/:passengerId', async (req, res) => {
+  const { passengerId } = req.params;
+  try {
+    const safePassengerId = await resolveUserId(passengerId);
+    const result = await db.query(
+      `SELECT gr.*,
+              orig.name AS pickup_name, orig.latitude AS pickup_lat, orig.longitude AS pickup_lng,
+              dest.name AS dropoff_name, dest.latitude AS dropoff_lat, dest.longitude AS dropoff_lng
+       FROM group_trip_requests gr
+       JOIN locations orig ON gr.pickup_id = orig.id
+       JOIN locations dest ON gr.dropoff_id = dest.id
+       WHERE (gr.passenger_id = $1 OR gr.passenger_id = $2)
+         AND gr.status = 'pending'
+       ORDER BY gr.created_at DESC LIMIT 1`,
+      [safePassengerId, passengerId]
+    );
+
+    res.json({ success: true, request: result.rows[0] || null });
+  } catch (err) {
+    console.error('Fetch passenger request error:', err);
+    res.status(500).json({ error: 'Failed to fetch passenger request' });
+  }
+});
+
+// ==============================================================================
 // 7. DIGITAL PAYMENTS & SETTLEMENT (bKash / Nagad / Cash)
 // POST /v1/bookings/pay
 // ==============================================================================
@@ -841,9 +903,9 @@ app.get('/v1/bookings/:userId', async (req, res) => {
   }
 });
 
-// AI-Powered Fare Estimation with Baseline Formula & Weather Surcharge
+// AI-Powered Fare Estimation with Baseline Formula & Auto Weather Surcharge (Open-Meteo)
 // Formula: 50 BDT for 0-5 km, +10 BDT for each additional km.
-// Weather: if rain multiply by 1.25, else 1.0.
+// Weather: Auto-detected via Open-Meteo API (rain = 1.25x, clear = 1.0x).
 // If AI API key is configured (Gemini, OpenAI, or Custom LLM), prompt AI to analyze & validate.
 app.post('/v1/fare/estimate', async (req, res) => {
   try {
@@ -852,6 +914,8 @@ app.post('/v1/fare/estimate', async (req, res) => {
       origin,
       destination,
       weather,
+      origin_lat,
+      origin_lng,
       departure_time,
     } = req.body;
 
@@ -860,9 +924,47 @@ app.post('/v1/fare/estimate', async (req, res) => {
     // Baseline rule formula: 50tk for 0-5km and +10tk for each additional km
     const baseFare = dist <= 5.0 ? 50.0 : 50.0 + (dist - 5.0) * 10.0;
 
-    // Weather condition multiplier: rain = 1.25, else = 1.0
-    const weatherStr = (weather || '').toString().toLowerCase();
-    const isRain = weatherStr.includes('rain');
+    // Automatic Live Weather Detection via Open-Meteo API
+    const lat = origin_lat || 22.4608;
+    const lng = origin_lng || 91.9710;
+    let isRain = false;
+    let detectedWeather = 'clear';
+    let weatherSource = 'open-meteo';
+
+    // Check if client explicitly sent weather override or detect via Open-Meteo
+    if (weather && weather.toString().toLowerCase().includes('rain')) {
+      isRain = true;
+      detectedWeather = 'rain';
+      weatherSource = 'manual';
+    } else if (weather && weather.toString().toLowerCase().includes('clear')) {
+      isRain = false;
+      detectedWeather = 'clear';
+      weatherSource = 'manual';
+    } else {
+      // Auto-query Open-Meteo for live rain/precipitation forecast
+      try {
+        const meteoRes = await fetch(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=precipitation,rain,weather_code`,
+          { signal: AbortSignal.timeout(3000) }
+        );
+        if (meteoRes.ok) {
+          const meteoData = await meteoRes.json();
+          const current = meteoData?.current;
+          if (current) {
+            const rainAmount = (current.precipitation || 0) + (current.rain || 0);
+            const rainyCodes = [51, 53, 55, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99];
+            if (rainAmount > 0.05 || rainyCodes.includes(current.weather_code)) {
+              isRain = true;
+              detectedWeather = 'rain';
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('Open-Meteo live forecast lookup failed, using fallback:', e.message);
+        weatherSource = 'fallback';
+      }
+    }
+
     const weatherMultiplier = isRain ? 1.25 : 1.0;
     const ruleBasedFare = Math.round(baseFare * weatherMultiplier);
 
@@ -1011,6 +1113,7 @@ Respond ONLY with a JSON object in this format:
       distance_km: dist,
       weather: isRain ? 'rain' : 'clear',
       weather_multiplier: weatherMultiplier,
+      weather_source: weatherSource,
       rule_based_fare: ruleBasedFare,
       ai_adjusted: aiAdjusted,
       provider: aiProvider,
